@@ -1,228 +1,224 @@
-# bot.py
-import telebot
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import re
-import csv
 import os
-from datetime import datetime
+import pandas as pd
+import torch
+from sentence_transformers import SentenceTransformer, util
+import csv
+import re
 import logging
-
-# ==================== КОНФИГУРАЦИЯ ====================
-BOT_TOKEN = "8450391232:AAGtconwAu_Lig4gre6k05NJgXWukh6NIHU"  # Замени на свой токен
-MODEL_PATH = "./my_rugpt3_finetuned"  # Путь к обученной модели
-SHABLON_FILE = "shablon.csv"
+import telebot
+from telebot import types
 
 # Настройка логирования
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("bot.log"),
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Загрузка шаблонов из CSV
-def load_shablons():
-    shablons = {}
-    try:
-        with open(SHABLON_FILE, 'r', encoding='utf-8') as file:
+class FAQTelegramBot:
+    def __init__(self, model_dir="./model", csv_path="data_new.csv", template_path="shablon.csv"):
+        self.model_dir = model_dir
+        self.csv_path = csv_path
+        self.template_path = template_path
+        self.model = None
+        self.df = None
+        self.templates = {}
+        self.corpus_embeddings = None
+        
+        os.makedirs(model_dir, exist_ok=True)
+        self.load_or_download_model()
+        self.load_data()
+        self.load_templates()
+        self.encode_corpus()
+    
+    def load_or_download_model(self):
+        model_name = 'sentence-transformers/all-MiniLM-L6-v2'
+        local_model_path = os.path.join(self.model_dir, 'all-MiniLM-L6-v2')
+        
+        try:
+            logger.info("Пытаюсь загрузить модель из локальной папки...")
+            self.model = SentenceTransformer(local_model_path)
+            logger.info("✅ Модель успешно загружена из локальной папки!")
+        except:
+            logger.info("❌ Локальная модель не найдена. Скачиваю модель...")
+            try:
+                self.model = SentenceTransformer(model_name)
+                self.model.save(local_model_path)
+                logger.info(f"✅ Модель сохранена в: {local_model_path}")
+            except Exception as e:
+                logger.error(f"❌ Ошибка при скачивании модели: {e}")
+                raise
+    
+    def load_data(self):
+        try:
+            logger.info(f"Пытаюсь загрузить данные из {self.csv_path}...")
+            try:
+                self.df = pd.read_csv(self.csv_path, header=None, names=['question', 'answer'])
+                logger.info("✅ Данные загружены стандартным способом")
+            except:
+                self.df = pd.read_csv(
+                    self.csv_path, 
+                    header=None, 
+                    names=['question', 'answer'],
+                    quoting=csv.QUOTE_ALL,
+                    escapechar='\\'
+                )
+                logger.info("✅ Данные загружены с обработкой кавычек")
+            logger.info(f"📊 Загружено {len(self.df)} вопросов-ответов")
+        except Exception as e:
+            logger.error(f"❌ Ошибка при загрузке CSV файла: {e}")
+            self.load_data_manual()
+    
+    def load_data_manual(self):
+        data = []
+        with open(self.csv_path, 'r', encoding='utf-8') as file:
             reader = csv.reader(file)
-            for row in reader:
+            for i, row in enumerate(reader):
                 if len(row) >= 2:
-                    # Убираем кавычки если есть
-                    key = row[0].strip().strip('"')
-                    value = row[1].strip().strip('"')
-                    shablons[key] = value
-        logger.info(f"✅ Загружено {len(shablons)} шаблонов")
-        return shablons
-    except Exception as e:
-        logger.error(f"❌ Ошибка загрузки шаблонов: {e}")
-        return {}
-
-# Загрузка модели
-def load_model():
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-        model = AutoModelForCausalLM.from_pretrained(MODEL_PATH)
-        
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-            
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = model.to(device)
-        
-        logger.info(f"✅ Модель загружена на устройство: {device}")
-        return tokenizer, model, device
-    except Exception as e:
-        logger.error(f"❌ Ошибка загрузки модели: {e}")
-        return None, None, None
-
-# Функция замены шаблонов
-def replace_shablons(text, shablons):
-    """Заменяет шаблоны в тексте на значения из словаря"""
-    if not text:
-        return text
+                    question = row[0].strip()
+                    answer = ' '.join(row[1:]).strip()
+                    data.append([question, answer])
+                else:
+                    logger.warning(f"⚠️ Пропущена строка {i+1}: неверное количество полей - {row}")
+        self.df = pd.DataFrame(data, columns=['question', 'answer'])
+        logger.info(f"✅ Данные загружены вручную. Загружено {len(self.df)} записей")
+        if len(self.df) == 0:
+            raise Exception("Не удалось загрузить данные")
     
-    # Ищем все шаблоны в формате [название шаблона]
-    pattern = r'\[(.*?)\]'
-    matches = re.findall(pattern, text)
+    def load_templates(self):
+        try:
+            logger.info(f"Загружаю шаблоны из {self.template_path}...")
+            with open(self.template_path, 'r', encoding='utf-8') as file:
+                content = file.read().splitlines()
+                for line in content:
+                    if ',' in line:
+                        parts = line.split(',', 1)
+                        if len(parts) >= 2:
+                            key = parts[0].strip()
+                            value = parts[1].strip()
+                            if key.startswith('[') and key.endswith(']'):
+                                key = key[1:-1]
+                            if value.startswith('"') and value.endswith('"'):
+                                value = value[1:-1]
+                            self.templates[key] = value
+            logger.info(f"✅ Загружено {len(self.templates)} шаблонов")
+        except Exception as e:
+            logger.error(f"❌ Ошибка при загрузке шаблонов: {e}")
     
-    if not matches:
-        return text
+    def replace_templates(self, text):
+        if not self.templates:
+            return text
+        templates_found = re.findall(r'\[(.*?)\]', text)
+        if not templates_found:
+            return text
+        result = text
+        for template in templates_found:
+            if template in self.templates:
+                replacement = self.templates[template]
+                result = result.replace(f"[{template}]", replacement)
+                logger.debug(f"Заменен шаблон '[{template}]' -> '{replacement}'")
+        return result
     
-    result = text
-    for match in matches:
-        template_key = f"[{match}]"
-        if template_key in shablons:
-            # Заменяем шаблон на значение
-            result = result.replace(template_key, shablons[template_key])
-        else:
-            # Удаляем шаблон если он не найден
-            result = result.replace(template_key, "").strip()
+    def encode_corpus(self):
+        logger.info("Кодирую базу вопросов...")
+        questions = self.df['question'].tolist()
+        self.corpus_embeddings = self.model.encode(
+            questions,
+            convert_to_tensor=True,
+            show_progress_bar=False,
+            normalize_embeddings=True
+        )
+        logger.info("✅ База вопросов закодирована!")
     
-    # Убираем лишние пробелы после удаления шаблонов
-    result = re.sub(r'\s+', ' ', result).strip()
-    return result
+    def find_best_answer(self, query, top_k=1):
+        query_embedding = self.model.encode(query, convert_to_tensor=True, normalize_embeddings=True)
+        cos_scores = util.cos_sim(query_embedding, self.corpus_embeddings)[0]
+        top_score, top_idx = torch.max(cos_scores, dim=0)
+        original_answer = self.df.iloc[top_idx.item()]['answer']
+        processed_answer = self.replace_templates(original_answer)
+        return {
+            'question': self.df.iloc[top_idx.item()]['question'],
+            'answer': processed_answer,
+            'score': top_score.item()
+        }
 
-# Генерация ответа моделью
-def generate_response(question, tokenizer, model, device, max_length=200):
-    try:
-        prompt = f"В: {question}\nО:"
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        
-        with torch.no_grad():
-            outputs = model.generate(
-                inputs.input_ids,
-                max_length=max_length,
-                num_return_sequences=1,
-                temperature=0.7,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
-                repetition_penalty=1.2,
-                early_stopping=True
-            )
-        
-        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        # Извлекаем только ответ (часть после "О:")
-        answer = generated_text[len(prompt):].strip()
-        
-        # Обрезаем ответ если он слишком длинный
-        if len(answer) > 400:
-            answer = answer[:400] + "..."
-            
-        return answer
-    except Exception as e:
-        logger.error(f"❌ Ошибка генерации: {e}")
-        return "Извините, произошла ошибка при генерации ответа."
+# === TELEBOT ИНТЕГРАЦИЯ ===
 
-# Инициализация бота
+# Токен вашего Telegram-бота
+BOT_TOKEN = "8450391232:AAGtconwAu_Lig4gre6k05NJgXWukh6NIHU"
+
+if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+    raise ValueError("❌ Пожалуйста, установите ваш токен бота в переменной BOT_TOKEN")
+
+# Создаём бота
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Загрузка данных при старте
-SHABLONS = load_shablons()
-TOKENIZER, MODEL, DEVICE = load_model()
+# Глобальный экземпляр FAQ бота
+faq_bot = None
 
-# Статистика использования
-usage_stats = {
-    "total_requests": 0,
-    "successful_responses": 0,
-    "users": set()
-}
-
-# ==================== ОБРАБОТЧИКИ СООБЩЕНИЙ ====================
-@bot.message_handler(commands=['start', 'help'])
+@bot.message_handler(commands=['start'])
 def send_welcome(message):
     welcome_text = """
-🤖 Добро пожаловать в чат-бот Альметьевского политехнического техникума!
+🤖 Добро пожаловать в FAQ бот!
 
-Я могу помочь вам с информацией о:
-• Расписании занятий
-• Поступлении и документах
-• Отделениях и специальностях
-• IT-Кубе и кружках
-• Общежитии и стипендиях
-• Контактах преподавателей
+Просто напишите ваш вопрос, и я найду на него ответ в базе знаний.
 
-Просто задайте ваш вопрос, и я постараюсь помочь!
-
-📊 Статистика: /stats
-🆘 Помощь: /help
-    """
+Примеры вопросов:
+• Как узнать расписание?
+• Где найти контакты?
+• Как поступить в университет?
+"""
     bot.reply_to(message, welcome_text)
-    logger.info(f"👋 Пользователь {message.from_user.id} начал диалог")
 
-@bot.message_handler(commands=['stats'])
-def send_stats(message):
-    stats_text = f"""
-📊 Статистика бота:
-• Всего запросов: {usage_stats['total_requests']}
-• Успешных ответов: {usage_stats['successful_responses']}
-• Уникальных пользователей: {len(usage_stats['users'])}
-• Последнее обновление: {datetime.now().strftime('%H:%M:%S')}
-    """
-    bot.reply_to(message, stats_text)
+@bot.message_handler(commands=['help'])
+def send_help(message):
+    help_text = """
+📖 Помощь по боту:
+
+• Просто напишите ваш вопрос в чат
+• Бот найдет самый подходящий ответ из базы знаний
+• Ответы автоматически форматируются с актуальными ссылками
+
+Если ответ не точный, попробуйте перефразировать вопрос.
+"""
+    bot.reply_to(message, help_text)
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
-    user_id = message.from_user.id
-    question = message.text.strip()
-    
-    # Обновляем статистику
-    usage_stats["total_requests"] += 1
-    usage_stats["users"].add(user_id)
-    
-    logger.info(f"❓ Вопрос от {user_id}: {question}")
-    
-    # Проверяем загружена ли модель
-    if TOKENIZER is None or MODEL is None:
-        bot.reply_to(message, "⚠️ Модель временно недоступна. Попробуйте позже.")
-        return
-    
-    # Показываем что бот печатает
-    bot.send_chat_action(message.chat.id, 'typing')
-    
     try:
-        # Генерируем ответ моделью
-        raw_answer = generate_response(question, TOKENIZER, MODEL, DEVICE)
-        
-        # Заменяем шаблоны
-        final_answer = replace_shablons(raw_answer, SHABLONS)
-        
-        # Если ответ пустой после замены шаблонов
-        if not final_answer or len(final_answer) < 5:
-            final_answer = "Извините, не удалось сгенерировать подходящий ответ. Попробуйте переформулировать вопрос."
-        
-        # Отправляем ответ
-        bot.reply_to(message, final_answer)
-        usage_stats["successful_responses"] += 1
-        
-        logger.info(f"✅ Ответ для {user_id}: {final_answer[:100]}...")
-        
-    except Exception as e:
-        error_msg = "❌ Произошла ошибка при обработке вашего запроса. Попробуйте еще раз."
-        bot.reply_to(message, error_msg)
-        logger.error(f"❌ Ошибка обработки для {user_id}: {e}")
+        user_message = message.text
+        logger.info(f"User {message.from_user.id}: '{user_message}'")
 
-# ==================== ЗАПУСК БОТА ====================
-if __name__ == "__main__":
-    logger.info("🚀 Запуск телеграм бота...")
-    
-    if TOKENIZER is None or MODEL is None:
-        logger.error("❌ Не удалось загрузить модель! Бот не может быть запущен.")
-        exit(1)
+        # Имитация "печатания" (необязательно, но приятно)
+        bot.send_chat_action(message.chat.id, 'typing')
+
+        result = faq_bot.find_best_answer(user_message)
         
-    if not SHABLONS:
-        logger.warning("⚠️ Шаблоны не загружены, ответы будут без замены!")
-    
-    print("🤖 Бот запущен и готов к работе!")
-    print("⏹️ Для остановки нажмите Ctrl+C")
-    
-    try:
-        bot.polling(none_stop=True, interval=0)
-    except KeyboardInterrupt:
-        logger.info("🛑 Бот остановлен пользователем")
+        if result['score'] > 0.3:
+            response = f"💡 {result['answer']}"
+            if result['score'] < 0.5:
+                response += "\n\n⚠️ Если этот ответ не подходит, попробуйте перефразировать вопрос."
+        else:
+            response = "❌ К сожалению, я не нашел подходящего ответа в базе знаний. Попробуйте перефразировать вопрос или обратитесь в поддержку."
+
+        bot.reply_to(message, response)
+        logger.info(f"Ответ отправлен. Score: {result['score']:.4f}")
+
     except Exception as e:
-        logger.error(f"❌ Критическая ошибка бота: {e}")
+        logger.error(f"Ошибка при обработке сообщения: {e}")
+        bot.reply_to(message, "❌ Произошла ошибка при обработке запроса. Попробуйте позже.")
+
+def main():
+    global faq_bot
+    print("🚀 Инициализация FAQ бота...")
+    faq_bot = FAQTelegramBot(
+        model_dir="./faq_model",
+        csv_path="data_new.csv",
+        template_path="shablon.csv"
+    )
+    print("✅ FAQ бот инициализирован!")
+    print("🤖 Запускаю Telegram бота...")
+    bot.infinity_polling()
+
+if __name__ == "__main__":
+    main()
