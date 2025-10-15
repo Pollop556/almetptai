@@ -16,7 +16,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class FAQTelegramBot:
-    def __init__(self, model_dir="./model", csv_path="data_new.csv", template_path="shablon.csv"):
+    def __init__(self, model_dir="./model", csv_path="data_conter.csv", template_path="shablon.csv"):
         self.model_dir = model_dir
         self.csv_path = csv_path
         self.template_path = template_path
@@ -32,15 +32,16 @@ class FAQTelegramBot:
         self.encode_corpus()
     
     def load_or_download_model(self):
-        model_name = 'sentence-transformers/all-MiniLM-L6-v2'
-        local_model_path = os.path.join(self.model_dir, 'all-MiniLM-L6-v2')
+        # Используем rubert-tiny2 — отличная модель для русского языка
+        model_name = 'cointegrated/rubert-tiny2'
+        local_model_path = os.path.join(self.model_dir, 'rubert-tiny2')
         
         try:
             logger.info("Пытаюсь загрузить модель из локальной папки...")
             self.model = SentenceTransformer(local_model_path)
             logger.info("✅ Модель успешно загружена из локальной папки!")
-        except:
-            logger.info("❌ Локальная модель не найдена. Скачиваю модель...")
+        except Exception as e:
+            logger.info(f"❌ Локальная модель не найдена ({e}). Скачиваю модель...")
             try:
                 self.model = SentenceTransformer(model_name)
                 self.model.save(local_model_path)
@@ -189,7 +190,7 @@ def handle_message(message):
         user_message = message.text
         logger.info(f"User {message.from_user.id}: '{user_message}'")
 
-        # Имитация "печатания" (необязательно, но приятно)
+        # Имитация "печатания"
         bot.send_chat_action(message.chat.id, 'typing')
 
         result = faq_bot.find_best_answer(user_message)
@@ -210,10 +211,10 @@ def handle_message(message):
 
 def main():
     global faq_bot
-    print("🚀 Инициализация FAQ бота...")
+    print("🚀 Инициализация FAQ бота с rubert-tiny2...")
     faq_bot = FAQTelegramBot(
         model_dir="./faq_model",
-        csv_path="data_new.csv",
+        csv_path="data_conter.csv",
         template_path="shablon.csv"
     )
     print("✅ FAQ бот инициализирован!")
